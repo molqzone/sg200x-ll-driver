@@ -32,22 +32,39 @@
  * @param OP 使用 a0 的指令字符串 / Instruction string using a0.
  * @param addr 范围起始地址 / Range start address.
  * @param size 范围长度，单位为字节 / Range length in bytes.
- * @note 显式绑定 a0 并保留 memory clobber，避免优化和 LTO 改变操作数；末尾执行 sync.s。
- *       Bind a0 explicitly and retain the memory clobber so optimization and LTO cannot detach the operand;
- *       finish with sync.s.
+ *
+ * 整条循环写在**一条 asm 语句**里，a0 由汇编自己管理——这是必须的：T-Head 的
+ * dcache.ipa/cpa/cipa 只认 a0，而 C 循环加 "r"(line_) 约束不保证循环体内
+ * line_ 仍在 a0（编译器可重分配），多行范围会静默清错地址。mainline Linux 的
+ * THEAD_CMO_OP（arch/riscv/errata/thead/errata.c）同样把循环放进汇编。
+ *
+ * The whole loop lives in **one asm statement** so a0 is managed by the
+ * assembler, not the compiler. This is required: T-Head's dcache.ipa/cpa/cipa
+ * only reads a0, and a C loop with an "r"(line_) constraint does not keep
+ * line_ in a0 inside the body (the compiler may reallocate it), so a multi-line
+ * range silently cleans the wrong addresses. Mainline Linux's THEAD_CMO_OP
+ * (arch/riscv/errata/thead/errata.c) keeps the loop in assembly for the same
+ * reason.
  */
-#define DCACHE_OP_RANGE(OP, addr, size)                                                                      \
-    do                                                                                                       \
-    {                                                                                                        \
-        register uintptr_t line_ __asm__("a0") = (uintptr_t)(addr) & ~(uintptr_t)(LL_DCACHE_LINE_SIZE - 1U); \
-        const uintptr_t end_ =                                                                               \
-            (((uintptr_t)(addr) + (size_t)(size) + (LL_DCACHE_LINE_SIZE - 1U)) &                             \
-             ~(uintptr_t)(LL_DCACHE_LINE_SIZE - 1U));                                                        \
-        for (; line_ < end_; line_ += LL_DCACHE_LINE_SIZE)                                                   \
-        {                                                                                                    \
-            __asm__ __volatile__(OP : : "r"(line_) : "memory");                                              \
-        }                                                                                                    \
-        __asm__ __volatile__(SYNC_S ::: "memory");                                                           \
+#define DCACHE_OP_RANGE(OP, addr, size)                                          \
+    do                                                                           \
+    {                                                                            \
+        const uintptr_t start_ =                                                 \
+            (uintptr_t)(addr) & ~(uintptr_t)(LL_DCACHE_LINE_SIZE - 1U);          \
+        const uintptr_t end_ =                                                   \
+            (((uintptr_t)(addr) + (size_t)(size) + (LL_DCACHE_LINE_SIZE - 1U)) & \
+             ~(uintptr_t)(LL_DCACHE_LINE_SIZE - 1U));                            \
+        __asm__ __volatile__("mv a0, %1\n\t"                                   \
+                             "j 2f\n\t"                                        \
+                             "3:\n\t"                                          \
+                             OP "\n\t"                                         \
+                             "add a0, a0, %0\n\t"                              \
+                             "2:\n\t"                                          \
+                             "bltu a0, %2, 3b\n\t"                             \
+                             SYNC_S                                              \
+                             :                                                   \
+                             : "r"(LL_DCACHE_LINE_SIZE), "r"(start_), "r"(end_)  \
+                             : "a0", "memory");                                  \
     } while (0)
 
 void sg200x_ll_csr_dcache_invalidate_range(uintptr_t addr, size_t size)

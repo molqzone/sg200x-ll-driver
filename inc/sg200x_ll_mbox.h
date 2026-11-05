@@ -1,116 +1,135 @@
 #pragma once
 
-#include <stdbool.h>
-#include <stddef.h>
 #include <stdint.h>
 
 /**
- * @brief 共享邮箱槽的布局和所有权状态编码 / Layout and ownership-state encodings of a shared mailbox slot.
+ * @file sg200x_ll_mbox.h
+ * @brief SG200x mailbox 外设的寄存器原语 / Register primitives of the SG200x mailbox
+ *        peripheral.
  *
- * @note 基址、总大小和头部大小按 64 字节缓存行对齐；配置和输出对象位于共享区之外。
- *       Align the base, total size, and header size to 64-byte cache lines; keep configuration and output
- *       objects outside the shared region.
+ * 这颗外设有 4 个 bank（每个核一个接收 bank），每个 bank 有 8 个 set 位；位 n 对应
+ * 上下文槽 n —— 槽是 8 字节的共享寄存器窗口。中断语义是“bank 里哪个位被置起”，所以
+ * 状态是成对的：`int_status` 读已屏蔽的状态，`int_raw` 读原始状态，`int_clear` 写回
+ * 一个 set 位子集来清掉它们。
+ *
+ * The peripheral has four banks (one receive bank per core) with eight set bits each;
+ * bit n owns context slot n, an eight-byte window of shared registers.  Interrupt state
+ * is per bit, so the accessors come in pairs: `int_status` reads the masked state,
+ * `int_raw` the raw one, and `int_clear` writes a set-bit mask back to clear it.
+ *
+ * 这里只管寄存器：**哪个 bank 是本核的、位怎么分配、什么时候响铃**都是驱动层的策略。
+ * 本层不持状态，也不做缓存维护——上下文槽的地址由 `ctx_addr` 给出，调用方拿它去做
+ * clean/invalidate，因为缓存策略属于调用方的一致性域。
+ *
+ * Registers only: which bank belongs to this core, how the bits are allocated and when
+ * to ring are driver policy.  This layer keeps no state and performs no cache
+ * maintenance -- `ctx_addr` hands out the slot address so the caller can
+ * clean/invalidate it in its own coherency domain.
  */
-typedef struct
-{
-    uintptr_t base; ///< 共享区的本地映射地址。 Locally mapped address of the shared region.
-    size_t size;    ///< 包括头部在内的共享区字节数。 Shared-region bytes including the header.
-    size_t header_size; ///< 头部字节数，载荷紧随其后。 Header bytes; the payload follows immediately.
-    size_t state_offset; ///< 头部内按 4 字节对齐的状态字偏移。 Four-byte-aligned state-word offset within the
-                         ///< header.
-    uint32_t empty_state; ///< 将槽交给生产者的状态值。 State value granting the slot to the producer.
-    uint32_t ready_state; ///< 将槽交给消费者的状态值。 State value granting the slot to the consumer.
-} sg200x_ll_mbox_config_t;
-
-/**
- * @brief 非阻塞邮箱操作的结果 / Result of a nonblocking mailbox operation.
- */
-typedef enum
-{
-    LL_MBOX_OK,      ///< 操作已完成。 Operation completed.
-    LL_MBOX_BUSY,    ///< 槽不处于所需状态。 Slot is not in the required state.
-    LL_MBOX_INVALID, ///< 布局、缓冲区或长度无效。 Invalid layout, buffer, or length.
-} sg200x_ll_mbox_result_t;
 
 #ifdef __cplusplus
 extern "C"
 {
 #endif
 
-    /**
-     * @brief 检查共享邮箱布局而不访问共享区。
-     *        Validate a shared mailbox layout without accessing the shared region.
-     *
-     * @param[in] config 调用者持有的不可变邮箱布局描述 / Caller-owned immutable mailbox layout description.
-     * @return 对齐、大小、状态位置及地址范围均有效时返回 true。
-     *         True when alignment, sizes, state location, and address bounds are valid.
-     */
-    bool sg200x_ll_mbox_config_valid(const sg200x_ll_mbox_config_t *config);
+/** @brief bank 数量 / Number of set banks. */
+#define SG200X_LL_MBOX_BANKS 4U
+/** @brief 每个 bank 的 set 位数 / Set bits per bank, one per context slot. */
+#define SG200X_LL_MBOX_SLOTS 8U
+/** @brief 上下文槽的字节数（两个 32 位字）/ Context slot size in bytes. */
+#define SG200X_LL_MBOX_CTX_BYTES 8U
 
     /**
-     * @brief 取得就绪槽并把头部快照复制到本地 / Acquire a ready slot and copy its header snapshot locally.
-     *
-     * @param[in] config 调用者持有的不可变邮箱布局描述 / Caller-owned immutable mailbox layout description.
-     * @param[out] header 接收头部快照的本地缓冲区，失败时不变。
-     *        Local destination for the header snapshot; unchanged on failure.
-     * @param capacity 本地缓冲区容量，至少为 header_size 字节。
-     *        Local buffer capacity, at least header_size bytes.
-     * @note 成功后槽保持 ready，直至 rx_release；只有一个消费者，不分配或保存接收句柄。
-     *       The slot remains ready until rx_release; there is one consumer and no receive handle is allocated
-     *       or retained.
-     * @note 先刷新并观察状态字，再刷新整个头部，避免将发布前缓存的行复制进快照。
-     *       Refresh and observe the state word before refreshing the complete header, so lines cached before
-     *       publication cannot enter the snapshot.
+     * @brief 读某个 bank 的已屏蔽中断状态 / Read one bank's masked interrupt status.
+     * @param bank bank 编号（0..3）/ Bank index (0..3).
+     * @return 置起位的掩码，bit n = 槽 n / Mask of the pending bits, bit n = slot n.
      */
-    sg200x_ll_mbox_result_t
-    sg200x_ll_mbox_rx_acquire(const sg200x_ll_mbox_config_t *config, void *header, size_t capacity);
+    uint32_t sg200x_ll_mbox_int_status(uint32_t bank);
 
     /**
-     * @brief 同步已取得槽的载荷并返回只读视图。
-     *        Synchronize an acquired slot's payload and return a read-only view.
-     *
-     * @param[in] config 调用者持有的不可变邮箱布局描述 / Caller-owned immutable mailbox layout description.
-     * @param length 从已取得的本地头部快照读取的载荷长度。
-     *        Payload length read from the acquired local header snapshot.
-     * @param[out] payload 接收载荷地址的本地变量，失败时不变。
-     *        Local output for the payload address; unchanged on failure.
-     * @note 允许零长度消息；载荷视图在释放槽之前有效。
-     *       Zero-length messages are allowed; the payload view remains valid until release.
+     * @brief 读某个 bank 的原始中断状态（不受 mask 影响）/ Read the raw status.
+     * @param bank bank 编号（0..3）/ Bank index (0..3).
+     * @return 原始置位掩码 / Raw pending mask.
      */
-    sg200x_ll_mbox_result_t
-    sg200x_ll_mbox_rx_payload(const sg200x_ll_mbox_config_t *config, size_t length, const uint8_t **payload);
+    uint32_t sg200x_ll_mbox_int_raw(uint32_t bank);
 
     /**
-     * @brief 在所有读取完成后把消息槽交还生产者。
-     *        Return the message slot to the producer after all reads complete.
-     *
-     * @param[in] config 调用者持有的不可变邮箱布局描述 / Caller-owned immutable mailbox layout description.
-     * @note 只修改状态字，并只回写该状态字所在缓存行；相关 DMA 读取须已完成。
-     *       Only the state word changes and only its cache line is written back; related DMA reads must
-     *       already be complete.
+     * @brief 清掉某些 set 位的状态 / Clear the state of some set bits.
+     * @param bank bank 编号（0..3）/ Bank index (0..3).
+     * @param mask 要清的位 / Bits to clear.
      */
-    sg200x_ll_mbox_result_t sg200x_ll_mbox_rx_release(const sg200x_ll_mbox_config_t *config);
+    void sg200x_ll_mbox_int_clear(uint32_t bank, uint32_t mask);
 
     /**
-     * @brief 取得空槽以准备就地写入消息 / Acquire an empty slot to prepare a message in place.
-     *
-     * @param[in] config 调用者持有的不可变邮箱布局描述 / Caller-owned immutable mailbox layout description.
-     * @note 只有一个生产者；保持状态字为 empty，填写头部和载荷后调用 tx_publish。
-     *       There is one producer; keep the state word empty while filling the header and payload, then call
-     *       tx_publish.
+     * @brief 读某个 bank 的使能位 / Read one bank's enable bits.
+     * @param bank bank 编号（0..3）/ Bank index (0..3).
+     * @return 使能掩码 / Enable mask.
      */
-    sg200x_ll_mbox_result_t sg200x_ll_mbox_tx_acquire(const sg200x_ll_mbox_config_t *config);
+    uint32_t sg200x_ll_mbox_enable_get(uint32_t bank);
 
     /**
-     * @brief 写回头部和载荷后发布就绪状态 / Publish ready state after cleaning the header and payload.
-     *
-     * @param[in] config 调用者持有的不可变邮箱布局描述 / Caller-owned immutable mailbox layout description.
-     * @param length 生产者已写入的载荷字节数 / Number of payload bytes written by the producer.
-     * @note 仅在消息写回完成后设置 ready；发布后生产者不得修改该槽。
-     *       Ready is set only after message writeback completes; the producer must not modify the slot after
-     *       publication.
+     * @brief 置起某些使能位（读改写）/ Set some enable bits (read-modify-write).
+     * @param bank bank 编号（0..3）/ Bank index (0..3).
+     * @param mask 要置的位 / Bits to set.
      */
-    sg200x_ll_mbox_result_t sg200x_ll_mbox_tx_publish(const sg200x_ll_mbox_config_t *config, size_t length);
+    void sg200x_ll_mbox_enable_set(uint32_t bank, uint32_t mask);
+
+    /**
+     * @brief 清掉某些使能位（读改写）/ Clear some enable bits (read-modify-write).
+     * @param bank bank 编号（0..3）/ Bank index (0..3).
+     * @param mask 要清的位 / Bits to clear.
+     */
+    void sg200x_ll_mbox_enable_clear(uint32_t bank, uint32_t mask);
+
+    /**
+     * @brief 敲一次门铃：把给定的 set 位置起 / Ring the doorbell for the given bits.
+     * @param mask 要置起的位 / Bits to raise.
+     */
+    void sg200x_ll_mbox_doorbell(uint32_t mask);
+
+    /**
+     * @brief 读全局状态寄存器 / Read the global status register.
+     * @return 状态字 / Status word.
+     */
+    uint32_t sg200x_ll_mbox_status(void);
+
+    /**
+     * @brief 取一个上下文槽的地址，供缓存维护使用 / Address of one context slot.
+     * @param index 槽号（0..7）/ Slot index (0..7).
+     * @return 该槽的本地地址（8 字节，两字对齐）/ Local address of the slot.
+     * @note 本层不做缓存维护；需要 clean/invalidate 的调用方拿这个地址去做。
+     *       No cache maintenance here: a caller that needs it uses this address.
+     */
+    uintptr_t sg200x_ll_mbox_ctx_addr(uint32_t index);
+
+    /**
+     * @brief 原子读一个上下文槽的两个字 / Atomically read a slot's two words.
+     * @param index 槽号（0..7）/ Slot index (0..7).
+     * @param[out] value 收到的 8 字节（低字在前）/ Received eight bytes, low word first.
+     * @note RV64 上 8 字节对齐访问是单次原子读，这是“要么整条命令、要么没有”的前提。
+     *       On RV64 an aligned eight-byte access is a single atomic read, which is what
+     *       makes "a whole command or nothing" hold.
+     */
+    void sg200x_ll_mbox_ctx_load(uint32_t index, uint64_t *value);
+
+    /**
+     * @brief 写上下文槽的一个 32 位字 / Write one 32-bit word of a slot.
+     * @param index 槽号（0..7）/ Slot index (0..7).
+     * @param word 字编号（0 = 头，1 = 载荷）/ Word index (0 = header, 1 = payload).
+     * @param value 要写入的值 / Value to write.
+     * @note 顺序由调用方决定：这条 ABI 要求先写载荷字、再写头字，两次写之间由调用方
+     *       放屏障。本层只保证单次写是整字写，其余字节归零。
+     *       Ordering is the caller's: this ABI requires the payload word first and the
+     *       header word second, with the caller's barrier between.  Each store is one
+     *       whole word; the other byte lanes read back as zero.
+     */
+    void sg200x_ll_mbox_ctx_store_word(uint32_t index, uint32_t word, uint32_t value);
+
+    /**
+     * @brief 清零一个上下文槽 / Zero one context slot.
+     * @param index 槽号（0..7）/ Slot index (0..7).
+     */
+    void sg200x_ll_mbox_ctx_clear(uint32_t index);
 
 #ifdef __cplusplus
 }
