@@ -93,14 +93,15 @@ static inline uint32_t sg200x_ll_tim_read32(uintptr_t addr)
 
 /** @brief 小核 tick 使用的通道。Channel the little core's tick uses.
  *
- *  探针实测通道 4 挂在 PLIC IRQ 55 上，且时钟干净（25 MHz）。通道 6/7 实测只有
- *  12.5 MHz，所以不选它们。
- *  Channel 4 was measured on PLIC IRQ 55 with a clean 25 MHz clock.  Channels 6 and 7
- *  measured only 12.5 MHz, so they are not used. */
-#define SG200X_LL_TIM_TICK_CHANNEL 4U
+ *  通道 5 / PLIC IRQ 56。硬件上小核只能收 DW timer5 的中断——通道 4 虽然探针能测到
+ *  25 MHz 且 IRQ 55 会挂起，但那条中断送不到小核，表现为 tick 只跳一次就停。
+ *  Channel 5 / PLIC IRQ 56.  In hardware the little core can only take DW timer5's
+ *  interrupt -- channel 4 measures a clean 25 MHz and pends IRQ 55, but that interrupt
+ *  never reaches the little core, which shows up as the tick firing once and stopping. */
+#define SG200X_LL_TIM_TICK_CHANNEL 5U
 
 /** @brief 小核 tick 的 PLIC 中断号。PLIC IRQ of the little core's tick. */
-#define SG200X_LL_TIM_TICK_IRQ IRQ_TIMER4
+#define SG200X_LL_TIM_TICK_IRQ IRQ_TIMER5
 
 /** @brief 1 kHz tick 的计数值（25 MHz / 1000）。Count for a 1 kHz tick (25 MHz / 1000). */
 #define SG200X_LL_TIM_TICK_COUNT 25000U
