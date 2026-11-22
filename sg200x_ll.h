@@ -1,0 +1,20 @@
+#pragma once
+
+#include "device/sg2002.h"
+
+#include "inc/sg200x_ll_adc.h"
+#include "inc/sg200x_ll_csr.h"
+#include "inc/sg200x_ll_dma.h"
+#include "inc/sg200x_ll_dmamux.h"
+#include "inc/sg200x_ll_gpio.h"
+#include "inc/sg200x_ll_i2c.h"
+#include "inc/sg200x_ll_mbox.h"
+#include "inc/sg200x_ll_pinmux.h"
+#include "inc/sg200x_ll_plic.h"
+#include "inc/sg200x_ll_pwm.h"
+#include "inc/sg200x_ll_rcc.h"
+#include "inc/sg200x_ll_spi.h"
+#include "inc/sg200x_ll_tim.h"
+#include "inc/sg200x_ll_uart.h"
+#include "inc/sg200x_ll_utils.h"
+#include "inc/sg200x_ll_wdt.h"
