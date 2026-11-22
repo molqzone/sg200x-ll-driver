@@ -58,7 +58,9 @@ static inline void sg200x_ll_tim_write32(uintptr_t addr, uint32_t value)
 {
     *(volatile uint32_t*)addr = value;
     __asm__ __volatile__("fence iorw, iorw" ::: "memory");
+#if defined(__riscv)
     sg200x_ll_csr_dcache_clean_range(addr, sizeof(uint32_t));
+#endif
     sg200x_ll_csr_fence_io();
 }
 
@@ -70,7 +72,9 @@ static inline void sg200x_ll_tim_write32(uintptr_t addr, uint32_t value)
 static inline uint32_t sg200x_ll_tim_read32(uintptr_t addr)
 {
     sg200x_ll_csr_fence_io();
+#if defined(__riscv)
     sg200x_ll_csr_dcache_invalidate_range(addr, sizeof(uint32_t));
+#endif
     sg200x_ll_csr_fence_io();
     return *(volatile uint32_t*)addr;
 }
