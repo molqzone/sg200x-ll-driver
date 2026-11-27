@@ -1,197 +1,119 @@
 #include "sg200x_ll_mbox.h"
 
-#include <string.h>
+#include <stddef.h>
 
-#include "sg200x_ll_csr.h"
-
-/**
- * @brief 同步并使邮箱范围的本地缓存失效 / Synchronize and invalidate local cache for a mailbox range.
- *
- * @param address 范围起始地址 / Range start address.
- * @param length 范围字节数；0 时跳过缓存指令 / Range bytes; zero skips cache instructions.
- * @note 宿主构建使用一致性内存，仅执行屏障 / Host builds use coherent memory and only issue barriers.
- */
-static void invalidate(uintptr_t address, size_t length)
-{
-    sg200x_ll_csr_fence_io();
-#if defined(__riscv)
-    if (length != 0U)
-    {
-        sg200x_ll_csr_dcache_invalidate_range(address, length);
-    }
-#else
-
-    (void)address;
-    (void)length;
-#endif
-    sg200x_ll_csr_fence_io();
-}
+#include "sg2002.h"
 
 /**
- * @brief 写回邮箱范围并等待完成 / Clean a mailbox range and wait for completion.
+ * @file sg200x_ll_mbox.c
+ * @brief 邮箱外设寄存器布局的唯一描述 / The single description of the mailbox register
+ *        layout.
  *
- * @param address 范围起始地址 / Range start address.
- * @param length 范围字节数；0 时跳过缓存指令 / Range bytes; zero skips cache instructions.
- * @note 宿主构建使用一致性内存，仅执行屏障 / Host builds use coherent memory and only issue barriers.
- */
-static void clean(uintptr_t address, size_t length)
-{
-#if defined(__riscv)
-    if (length != 0U)
-    {
-        sg200x_ll_csr_dcache_clean_range(address, length);
-    }
-#else
-    (void)address;
-    (void)length;
-#endif
-    sg200x_ll_csr_fence_io();
-}
-
-/**
- * @brief 解析已验证邮箱布局的状态字地址 / Resolve the state-word address of a validated mailbox layout.
+ * 四个 bank 各是一个“使能字 + 四个 set 块”的组合；set 块里 `clr` 写 1 清状态、
+ * `intr` 是已屏蔽状态、`raw` 是原始状态。`0x60` 是敲门铃寄存器，`0x64` 是全局状态；
+ * 上下文槽在基址之上 1 KiB，每个 8 字节。
  *
- * @param[in] config 已验证的邮箱布局 / Validated mailbox layout.
- * @return 易失的 32 位状态字指针 / Pointer to the volatile 32-bit state word.
+ * Each bank is an enable word plus four set blocks; inside a block `clr` clears by
+ * writing ones, `intr` is the masked state and `raw` the raw one.  `0x60` is the
+ * doorbell and `0x64` the global status; the context slots sit 1 KiB above the base,
+ * eight bytes each.
  */
-static volatile uint32_t *state_word(const sg200x_ll_mbox_config_t *config)
+
+typedef struct
 {
-    return (volatile uint32_t *)(config->base + config->state_offset);
+    volatile uint32_t clr;
+    volatile uint32_t mask;
+    volatile uint32_t intr;
+    volatile uint32_t raw;
+} sg200x_ll_mbox_set_t;
+
+typedef struct
+{
+    volatile uint32_t enable[SG200X_LL_MBOX_BANKS];
+    sg200x_ll_mbox_set_t set[SG200X_LL_MBOX_BANKS];
+    volatile uint32_t reserved[4];
+    volatile uint32_t mbox_set;
+    volatile uint32_t mbox_status;
+    volatile uint32_t reserved2[2];
+    volatile uint32_t status[SG200X_LL_MBOX_BANKS];
+} sg200x_ll_mbox_regs_t;
+
+static_assert(offsetof(sg200x_ll_mbox_regs_t, set) == 0x10U,
+              "the set blocks follow the enable words");
+static_assert(offsetof(sg200x_ll_mbox_regs_t, mbox_set) == 0x60U,
+              "the doorbell register sits at 0x60");
+static_assert(offsetof(sg200x_ll_mbox_regs_t, mbox_status) == 0x64U,
+              "the global status register follows the doorbell");
+
+static volatile sg200x_ll_mbox_regs_t *mbox_regs(void)
+{
+    return (volatile sg200x_ll_mbox_regs_t *)APB_MAILBOX_BASE;
 }
 
-/**
- * @brief 按屏障及缓存顺序发布邮箱所有权状态。
- *        Publish mailbox ownership state with ordered barriers and cache maintenance.
- *
- * @param[in] config 已验证的邮箱布局 / Validated mailbox layout.
- * @param value 将发布的 empty 或 ready 状态值 / Empty or ready state value to publish.
- * @note 只回写状态字所在行；对端看到新状态后即可使用其他头部及载荷缓存行。
- *       Only the state line is written back; the peer may use other header and payload lines once it observes
- *       the new state.
- */
-static void publish_state(const sg200x_ll_mbox_config_t *config, uint32_t value)
+static volatile uint32_t *mbox_ctx(uint32_t index)
 {
-    sg200x_ll_csr_fence_io();
-    *state_word(config) = value;
-    sg200x_ll_csr_fence_io();
-#if defined(__riscv)
-
-    sg200x_ll_csr_dcache_clean_invalidate_range(config->base + config->state_offset, sizeof(uint32_t));
-#endif
-    sg200x_ll_csr_fence_io();
+    return (volatile uint32_t *)(MAILBOX_BUFF_BASE + index * SG200X_LL_MBOX_CTX_BYTES);
 }
 
-bool sg200x_ll_mbox_config_valid(const sg200x_ll_mbox_config_t *config)
+uint32_t sg200x_ll_mbox_int_status(uint32_t bank)
 {
-    if (config == nullptr || config->base == 0U || config->header_size == 0U ||
-        config->header_size > config->size || config->size > UINTPTR_MAX - config->base ||
-        config->empty_state == config->ready_state)
-    {
-        return false;
-    }
-    const uintptr_t mask = LL_DCACHE_LINE_SIZE - 1U;
-    return ((config->base | config->size | config->header_size) & mask) == 0U &&
-           config->state_offset % alignof(uint32_t) == 0U &&
-           config->state_offset <= config->header_size - sizeof(uint32_t);
+    return mbox_regs()->set[bank].intr;
 }
 
-/**
- * @brief 检查输出缓冲区是否非空、地址不溢出且位于共享区之外。
- *        Check that an output buffer is nonnull, does not overflow, and lies outside shared memory.
- *
- * @param[in] config 已验证的邮箱布局 / Validated mailbox layout.
- * @param buffer 待检查的本地缓冲区地址 / Local buffer address to check.
- * @param length 写入缓冲区的字节数 / Number of bytes written to the buffer.
- * @return 所述地址范围有效且不与共享区重叠时为 true。
- *         True when the range is valid and does not overlap shared memory.
- */
-static bool local_buffer(const sg200x_ll_mbox_config_t *config, const void *buffer, size_t length)
+uint32_t sg200x_ll_mbox_int_raw(uint32_t bank)
 {
-    const uintptr_t address = (uintptr_t)buffer;
-    return address != 0U && length <= UINTPTR_MAX - address &&
-           (address >= config->base + config->size ||
-            (address <= config->base && length <= config->base - address));
+    return mbox_regs()->set[bank].raw;
 }
 
-sg200x_ll_mbox_result_t
-sg200x_ll_mbox_rx_acquire(const sg200x_ll_mbox_config_t *config, void *header, size_t capacity)
+void sg200x_ll_mbox_int_clear(uint32_t bank, uint32_t mask)
 {
-    if (!sg200x_ll_mbox_config_valid(config) || capacity < config->header_size ||
-        !local_buffer(config, header, config->header_size))
-    {
-        return LL_MBOX_INVALID;
-    }
-    invalidate(config->base + config->state_offset, sizeof(uint32_t));
-    if (*state_word(config) != config->ready_state)
-    {
-        return LL_MBOX_BUSY;
-    }
-
-    invalidate(config->base, config->header_size);
-    memcpy(header, (const void *)config->base, config->header_size);
-    return LL_MBOX_OK;
+    mbox_regs()->set[bank].clr = mask;
 }
 
-sg200x_ll_mbox_result_t
-sg200x_ll_mbox_rx_payload(const sg200x_ll_mbox_config_t *config, size_t length, const uint8_t **payload)
+uint32_t sg200x_ll_mbox_enable_get(uint32_t bank)
 {
-    if (!sg200x_ll_mbox_config_valid(config) || length > config->size - config->header_size ||
-        !local_buffer(config, payload, sizeof(*payload)))
-    {
-        return LL_MBOX_INVALID;
-    }
-    if (*state_word(config) != config->ready_state)
-    {
-        return LL_MBOX_BUSY;
-    }
-    const uintptr_t address = config->base + config->header_size;
-    invalidate(address, length);
-    *payload = (const uint8_t *)address;
-    return LL_MBOX_OK;
+    return mbox_regs()->enable[bank];
 }
 
-sg200x_ll_mbox_result_t sg200x_ll_mbox_rx_release(const sg200x_ll_mbox_config_t *config)
+void sg200x_ll_mbox_enable_set(uint32_t bank, uint32_t mask)
 {
-    if (!sg200x_ll_mbox_config_valid(config))
-    {
-        return LL_MBOX_INVALID;
-    }
-    if (*state_word(config) != config->ready_state)
-    {
-        return LL_MBOX_BUSY;
-    }
-    publish_state(config, config->empty_state);
-    return LL_MBOX_OK;
+    mbox_regs()->enable[bank] |= mask;
 }
 
-sg200x_ll_mbox_result_t sg200x_ll_mbox_tx_acquire(const sg200x_ll_mbox_config_t *config)
+void sg200x_ll_mbox_enable_clear(uint32_t bank, uint32_t mask)
 {
-    if (!sg200x_ll_mbox_config_valid(config))
-    {
-        return LL_MBOX_INVALID;
-    }
-    invalidate(config->base + config->state_offset, sizeof(uint32_t));
-    if (*state_word(config) != config->empty_state)
-    {
-        return LL_MBOX_BUSY;
-    }
-    invalidate(config->base, config->header_size);
-    return LL_MBOX_OK;
+    mbox_regs()->enable[bank] &= ~mask;
 }
 
-sg200x_ll_mbox_result_t sg200x_ll_mbox_tx_publish(const sg200x_ll_mbox_config_t *config, size_t length)
+void sg200x_ll_mbox_doorbell(uint32_t mask)
 {
-    if (!sg200x_ll_mbox_config_valid(config) || length > config->size - config->header_size)
+    mbox_regs()->mbox_set = mask;
+}
+
+uint32_t sg200x_ll_mbox_status(void)
+{
+    return mbox_regs()->mbox_status;
+}
+
+uintptr_t sg200x_ll_mbox_ctx_addr(uint32_t index)
+{
+    return (uintptr_t)mbox_ctx(index);
+}
+
+void sg200x_ll_mbox_ctx_load(uint32_t index, uint64_t *value)
+{
+    if (value != NULL)
     {
-        return LL_MBOX_INVALID;
+        *value = *(volatile uint64_t *)mbox_ctx(index);
     }
-    if (*state_word(config) != config->empty_state)
-    {
-        return LL_MBOX_BUSY;
-    }
-    sg200x_ll_csr_fence_io();
-    clean(config->base + config->header_size, length);
-    clean(config->base, config->header_size);
-    publish_state(config, config->ready_state);
-    return LL_MBOX_OK;
+}
+
+void sg200x_ll_mbox_ctx_store_word(uint32_t index, uint32_t word, uint32_t value)
+{
+    mbox_ctx(index)[word & 1U] = value;
+}
+
+void sg200x_ll_mbox_ctx_clear(uint32_t index)
+{
+    *(volatile uint64_t *)mbox_ctx(index) = 0U;
 }

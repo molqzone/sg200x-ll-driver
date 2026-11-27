@@ -4,6 +4,7 @@
 
 #include "sg2002.h"
 #include "sg200x_ll_csr.h"
+#include "sg200x_ll_mmio.h"
 #include "sg200x_ll_utils.h"
 
 /**
@@ -39,7 +40,11 @@ static inline uint32_t sg200x_ll_plic_irq_priority_get(uint32_t irq) { return PL
  */
 static inline void sg200x_ll_plic_irq_enable(uint32_t irq)
 {
-    PLIC_C906L->ENABLE[irq / PLIC_IRQS_PER_WORD] |= LL_BIT(irq % PLIC_IRQS_PER_WORD);
+    /* 使能位必须真的到 PLIC：这段地址是可缓存的，普通 store 可能还脏在本核里。
+     * The enable bit must actually reach the PLIC: this range is cacheable, so a plain
+     * store can still sit dirty in this core. */
+    sg200x_ll_mmio_set_bits((volatile uint32_t *)&PLIC_C906L->ENABLE[irq / PLIC_IRQS_PER_WORD],
+                            LL_BIT(irq % PLIC_IRQS_PER_WORD));
 }
 
 /**
@@ -51,7 +56,8 @@ static inline void sg200x_ll_plic_irq_enable(uint32_t irq)
  */
 static inline void sg200x_ll_plic_irq_disable(uint32_t irq)
 {
-    PLIC_C906L->ENABLE[irq / PLIC_IRQS_PER_WORD] &= ~(uint32_t)LL_BIT(irq % PLIC_IRQS_PER_WORD);
+    sg200x_ll_mmio_clear_bits((volatile uint32_t *)&PLIC_C906L->ENABLE[irq / PLIC_IRQS_PER_WORD],
+                              LL_BIT(irq % PLIC_IRQS_PER_WORD));
 }
 
 /**
@@ -102,14 +108,23 @@ static inline uint32_t sg200x_ll_plic_threshold_get(void) { return PLIC_C906L->T
  * @note 读 CLAIM_COMPLETE 会把该源标记为服务中，完成后必须调用 irq_complete。
  *       Reading CLAIM_COMPLETE marks the source in service; call irq_complete after servicing it.
  */
-static inline uint32_t sg200x_ll_plic_irq_claim(void) { return PLIC_C906L->CLAIM_COMPLETE; }
+static inline uint32_t sg200x_ll_plic_irq_claim(void)
+{
+    /* claim 读到 0 表示"没有可处理的中断"；读必须穿过缓存，否则会一直领到旧值。
+     * A claim of zero means "nothing eligible"; the read must not be served from cache
+     * or the same source would be claimed forever. */
+    return sg200x_ll_mmio_load32((const volatile uint32_t *)&PLIC_C906L->CLAIM_COMPLETE);
+}
 
 /**
  * @brief 提交一个已领取中断源的处理完成通知 / Complete service of a previously claimed interrupt source.
  *
  * @param irq 先前由 irq_claim 领取的非零中断源编号 / Nonzero source ID previously returned by irq_claim.
  */
-static inline void sg200x_ll_plic_irq_complete(uint32_t irq) { PLIC_C906L->CLAIM_COMPLETE = irq; }
+static inline void sg200x_ll_plic_irq_complete(uint32_t irq)
+{
+    sg200x_ll_mmio_store32((volatile uint32_t *)&PLIC_C906L->CLAIM_COMPLETE, irq);
+}
 
 #if defined(__riscv)
 

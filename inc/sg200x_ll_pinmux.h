@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include "sg2002.h"
+#include "sg200x_ll_csr.h"
 #include "sg200x_ll_utils.h"
 
 /**

@@ -136,6 +136,55 @@ static inline bool sg200x_ll_dma_channel_is_valid(uint32_t channel) { return cha
  * @param enable 为 true 时使能，为 false 时禁止 / True to enable; false to disable.
  * @param enable_interrupts DMA 全局中断使能状态 / DMA global interrupt-enable state.
  */
+/** @brief 读取全局配置寄存器 / Read the controller's global configuration. */
+static inline uint32_t sg200x_ll_dma_cfg_get(void) { return DMA->GLOBAL.CFG; }
+
+/** @brief 写全局配置寄存器（只在确实需要时用）/ Write the global configuration. */
+static inline void sg200x_ll_dma_cfg_set(uint32_t value) { DMA->GLOBAL.CFG = value; }
+
+/**
+ * @brief 只在控制器**未使能**时才打开它，绝不改全局中断使能位。
+ *        Enable the controller only if it is off, and never touch the global interrupt bit.
+ *
+ * SD 卡（内核 MMC）用的是同一颗 DMAC 的 0–3 通道。放核期间若**无条件重写** `GLOBAL.CFG`，
+ * 会在内核正等 SD 传输时动到全局中断使能位，那次传输就永远收不到完成，表现为"放核即挂死
+ * 大核"（实测：首次开机正常，重启后应用在写录制时放核必挂）。
+ *
+ * 但也不能干脆不设：若控制器原本没使能中断，我们的 DMA 完成中断永远不来，SPI 读会一直
+ * 阻塞（实测：模块图卡在 BMI088 构造函数里，控制台停在 `[guided-dart] up`）。
+ * 所以是读-改-写，**只补齐缺的位**：内核已经设好时一个字节都不写，缺的时候才补。
+ * The SD card (kernel MMC) uses channels 0-3 of the same DMAC.  **Unconditionally**
+ * rewriting `GLOBAL.CFG` during a release flips the controller's global interrupt enable,
+ * so the SD transfer the kernel is waiting on never completes -- "releasing the core
+ * freezes the big core" (measured: first boot fine, a reboot with the recorder writing to
+ * SD always hung).
+ *
+ * Not setting it at all is the other failure: with the controller's interrupts off, our DMA
+ * completion never arrives and the SPI read blocks forever (measured: the graph stops in
+ * the BMI088 constructor, console ending at `[guided-dart] up`).  So this is a
+ * read-modify-write that fills in **only the missing bits**: nothing is written when the
+ * kernel already enabled both, and the bits are added when they are missing.
+ */
+static inline void sg200x_ll_dma_enable_if_off(void)
+{
+    /* 空实现：**不要**碰全局配置寄存器。/ Empty on purpose: **do not** touch GLOBAL.CFG.
+     *
+     * 读它不行：这个核对外设寄存器的可缓存读会做 64 字节行填充，落在实现范围外就回总线
+     * 错误（和 CLINT 那次同源，实测固件在第一行打印之前就停住）。
+     * 写它也不行：放核期间无条件写会改到全局中断使能位，内核正等的 SD 传输永远完不成
+     * （实测：录制写盘时重启必挂）。
+     * 控制器由引导/内核使能，本核只做按通道的配置与中断路由，所以这里什么都不用做。
+     *
+     * Reading it is out: a cacheable load on this core fills a 64-byte line, and a fill past
+     * the implemented range returns a bus error (the same trap as the CLINT; measured: the
+     * firmware stopped before printing its first line).
+     * Writing it is out too: an unconditional write during a release flips the global
+     * interrupt enable and the SD transfer the kernel is waiting on never completes
+     * (measured: a reboot with the recorder writing to SD always hung).
+     * The controller is enabled by the boot chain/kernel, and this core only configures its
+     * own channels and their interrupt routing, so nothing is needed here. */
+}
+
 static inline void sg200x_ll_dma_enable(bool enable, bool enable_interrupts)
 {
     DMA->GLOBAL.CFG =
